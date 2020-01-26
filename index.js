@@ -1,5 +1,6 @@
 const { graphql, buildSchema } = require('graphql');
-const { makeExecutableSchema, mergeSchemas, delegateToSchema, addResolveFunctionsToSchema } = require('graphql-tools');
+const graphqlTools = require('graphql-tools');
+const graphqlToolsFork = require('graphql-tools-fork');
 
 const typeDefs = [`
   type Query {
@@ -20,14 +21,6 @@ const resolvers = {
   },
 };
 
-const schema = makeExecutableSchema({
-  typeDefs,
-  resolvers,
-});
-const mergedSchema = mergeSchemas({
-  schemas: [schema],
-});
-
 const query = `
   {
     test {
@@ -37,45 +30,112 @@ const query = `
   }
 `;
 
-const calls = 20;
+const calls = 100;
 
-(async () => {
-  const { data: { __schema: { queryType: { fields } } } } = await graphql(schema, '{ __schema { queryType { fields { name } } } }');
-  const delegateResolvers = {
-    Query: fields.reduce((result, { name }) => {
-      result[name] = (root, args, context, info) => delegateToSchema({
-        schema: schema,
-        operation: 'query',
-        fieldName: name,
-        args,
-        context,
-        info,
-      });
-      return result;
-    }, {}),
-  };
+async function runConsecutiveTestSet(libraryName, test, query, calls) {
+  const testName = libraryName + ' ' + test.name;
+  console.time(testName);
+  for (let i = 0; i < calls; i++) {
+    await graphql(test.schema, query);
+  }
+  console.timeEnd(testName);
+}
+
+function generatePromises(schema, query, calls) {
+  const promises = [];
+  for (let i = 0; i < calls; i++) {
+    promises.push(graphql(schema, query));
+  }
+  return promises;
+}
+
+async function runConcurrentTestSet(libraryName, test, query, calls) {
+  const testName = libraryName + ' ' + test.name;
+  console.time(testName);
+  await Promise.all(generatePromises(test.schema, query, calls));
+  console.timeEnd(testName);
+}
+
+async function runAllTests(library) {
+  const {
+    makeExecutableSchema,
+    mergeSchemas,
+    delegateToSchema,
+    addResolveFunctionsToSchema,
+    transformSchema,
+  } = library.code;
+
+  const schema = makeExecutableSchema({
+    typeDefs,
+    resolvers,
+  });
 
   const delegateSchema = buildSchema(typeDefs[0]);
   addResolveFunctionsToSchema({
     schema: delegateSchema,
-    resolvers: delegateResolvers,
+    resolvers: {
+      Query: ['test'].reduce((result, name) => {
+        result[name] = (root, args, context, info) => delegateToSchema({
+          schema: schema,
+          operation: 'query',
+          fieldName: name,
+          args,
+          context,
+          info,
+        });
+        return result;
+      }, {}),
+    },
   });
 
-  console.time('direct');
-  for (let i = 0; i < calls; i++) {
-    await graphql(schema, query);
-  }
-  console.timeEnd('direct');
+  const mergedSchema = mergeSchemas({
+    schemas: [schema],
+  });
 
-  console.time('merged');
-  for (let i = 0; i < calls; i++) {
-    await graphql(mergedSchema, query);
-  }
-  console.timeEnd('merged');
+  const transformedSchema = transformSchema(schema, []);
 
-  console.time('delegate');
-  for (let i = 0; i < calls; i++) {
-    await graphql(delegateSchema, query);
+  const mergedTransformedSchema = mergeSchemas({
+    schemas: [transformedSchema],
+  });
+  
+  const tests = [
+    { name: 'direct', schema: schema, },
+    { name: 'delegate', schema: delegateSchema, },
+    { name: 'merged', schema: mergedSchema, },
+    { name: 'transformed', schema: transformedSchema, },
+    { name: 'mergedTransformed', schema: mergedTransformedSchema, },
+  ];
+
+  if (library.name === 'graphql-tools-fork') {
+
+    const integratedMergedTransformed = mergeSchemas({
+      schemas: [{
+        schema,
+        transforms: [],
+      }],
+    });
+
+    tests.push({ name: 'integratedMergedTransformed', schema: integratedMergedTransformed });
   }
-  console.timeEnd('delegate');
+
+  console.log('\nconsecutive tests (' + calls + '):\n');
+  for (let i = 0; i < tests.length; i++) {
+    await runConsecutiveTestSet(library.name, tests[i], query, calls);
+  }
+
+  console.log('\nconcurrent tests (' + calls + '):\n');
+  for (let i = 0; i < tests.length; i++) {
+    await runConcurrentTestSet(library.name, tests[i], query, calls);
+  }
+}
+
+const libraries = [
+  { name: 'graphql-tools', code: graphqlTools },
+  { name: 'graphql-tools-fork', code: graphqlToolsFork }
+];
+
+(async () => {
+  for (let i = 0; i < libraries.length; i++) {
+    await runAllTests(libraries[i]);
+  }
 })();
